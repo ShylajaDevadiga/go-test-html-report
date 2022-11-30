@@ -5,16 +5,26 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/Thatooine/go-test-html-report/assets"
-	"github.com/rs/zerolog/log"
+	"net/http"
+
+	"github.com/ShylajaDevadiga/go-test-html-report/assets"
 	"github.com/spf13/cobra"
+
 	"html/template"
 	"io/ioutil"
+	"log"
 	"math"
 	"os"
 	"strings"
 	"time"
 )
+
+type Output struct {
+	State string
+	Name  string
+	Type  string
+	Time  float64
+}
 
 type GoTestJsonRowData struct {
 	Time    time.Time
@@ -30,87 +40,69 @@ type ProcessedTestdata struct {
 	TestDate          string
 	FailedTests       int
 	PassedTests       int
+	SkippedTests      int
 	TestSummary       []TestOverview
-	PackageDetailsMap map[string]PackageDetails
+	packageDetailsIdx map[string]PackageDetails
 }
 
 type PackageDetails struct {
-	Name        string
-	ElapsedTime float64
-	TimeSymbol  string
-	Status      string
-	Coverage    string
+	Name         string
+	ElapsedTime  float64
+	Status       string
+	FailedTests  int
+	PassedTests  int
+	SkippedTests int
 }
 
 type TestDetails struct {
 	PackageName string
 	Name        string
 	ElapsedTime float64
-	TimeSymbol  string
 	Status      string
 }
 
 type TestOverview struct {
-	TestSuite TestDetails
+	Test      TestDetails
 	TestCases []TestDetails
 }
 
 func main() {
 	rootCmd := initCommand()
 	if err := rootCmd.Execute(); err != nil {
+		fmt.Println(err)
 		os.Exit(1)
 	}
 }
 
 var fileName string
-var outputDirectory string
+var packageName string
+var packages = make(map[string]string)
+var OS string
 
 func initCommand() *cobra.Command {
 	var rootCmd = &cobra.Command{
 		Use:   "go-test-html-report",
-		Long:  "go-test-html-report generates a html report of go-test logs",
 		Short: "go-test-html-report generates a html report of go-test logs",
 		RunE: func(cmd *cobra.Command, args []string) (e error) {
-			testData := make([]GoTestJsonRowData, 0)
-
 			file, _ := cmd.Flags().GetString("file")
+			testData := make([]GoTestJsonRowData, 0)
 			if file != "" {
-				fileLogData, err := ReadLogsFromFile(file)
-				if err != nil {
-					log.Error().Err(err).Msg("error reading logs from a file")
-					return err
-				}
-
-				testData = *fileLogData
+				testData = ReadLogsFromFile(file)
 			} else {
-				stdInLogData, err := ReadLogsFromStdIn()
-				if err != nil {
-					log.Error().Err(err).Msg("error reading logs from standard input ")
-					return err
-				}
-
-				testData = *stdInLogData
+				testData = ReadLogsFromStdIn()
 			}
 
-			processedTestdata, err := ProcessTestData(testData)
-			if err != nil {
-				log.Error().Err(err).Msg("error processing test logs")
-				return err
-			}
-
-			err = GenerateHTMLReport(processedTestdata.TotalTestTime,
+			processedTestdata := ProcessTestData(testData)
+			GenerateHTMLReport(processedTestdata.TotalTestTime,
 				processedTestdata.TestDate,
 				processedTestdata.FailedTests,
 				processedTestdata.PassedTests,
+				processedTestdata.SkippedTests,
 				processedTestdata.TestSummary,
-				processedTestdata.PackageDetailsMap,
+				processedTestdata.packageDetailsIdx,
 			)
-			if err != nil {
-				log.Error().Err(err).Msg("error generating report html")
-				return err
-			}
-
-			log.Info().Msgf("Report generated successfully")
+			log.Println("Report Generated")
+			//launchhtml()
 			return nil
 		},
 	}
@@ -119,184 +111,147 @@ func initCommand() *cobra.Command {
 		"file",
 		"f",
 		"",
-		"set the file of the go test json logs",
-	)
-	rootCmd.Flags().StringVarP(
-		&outputDirectory,
-		"output",
-		"o",
-		"",
-		"set the output directory of the html report",
-	)
+		"set the file of the go test json logs")
 	return rootCmd
 }
 
-func ReadLogsFromFile(fileName string) (*[]GoTestJsonRowData, error) {
+func ReadLogsFromFile(fileName string) []GoTestJsonRowData {
 	file, err := os.Open(fileName)
 	if err != nil {
-		log.Error().Err(err).Msg("error opening file")
-		return nil, err
+		log.Println("error opening file: ", err)
+		os.Exit(1)
 	}
 	defer func() {
 		err := file.Close()
 		if err != nil {
-			log.Error().Err(err).Msg("error closing file")
+			log.Println("error closing file: ", err)
+			os.Exit(1)
 		}
 	}()
 
 	// file scanner
 	scanner := bufio.NewScanner(file)
 	rowData := make([]GoTestJsonRowData, 0)
+
 	for scanner.Scan() {
 		row := GoTestJsonRowData{}
+
 		// unmarshall each line to GoTestJsonRowData
-		err = json.Unmarshal([]byte(scanner.Text()), &row)
+		err := json.Unmarshal([]byte(scanner.Text()), &row)
 		if err != nil {
-			log.Error().Err(err).Msg("error unmarshalling go test logs")
-			return nil, err
+			log.Println("error to unmarshall test logs: ", err)
+			os.Exit(1)
+		}
+		if row.Test != "" {
+			packageName = row.Test
+			packages[row.Test] = row.Action
 		}
 		rowData = append(rowData, row)
 	}
 
-	if err = scanner.Err(); err != nil {
-		log.Error().Err(err).Msg("error scanning file")
-		return nil, err
+	if err := scanner.Err(); err != nil {
+		log.Println("error with file scanner: ", err)
+		os.Exit(1)
 	}
-
-	return &rowData, nil
+	return rowData
 }
 
-func ReadLogsFromStdIn() (*[]GoTestJsonRowData, error) {
+func ReadLogsFromStdIn() []GoTestJsonRowData {
 	// stdin scanner
 	scanner := bufio.NewScanner(os.Stdin)
 	rowData := make([]GoTestJsonRowData, 0)
 	for scanner.Scan() {
 		row := GoTestJsonRowData{}
-		// unmarshall each line into GoTestJsonRowData
+		// unmarshall each line to GoTestJsonRowData
 		err := json.Unmarshal([]byte(scanner.Text()), &row)
 		if err != nil {
-			log.Error().Err(err).Msg("error unmarshalling the test logs")
-			return nil, err
+			log.Println("error to unmarshall test logs: ", err)
+			os.Exit(1)
 		}
 		rowData = append(rowData, row)
 	}
 	if err := scanner.Err(); err != nil {
-		log.Error().Err(err).Msg("error with stdin scanner")
-		return nil, err
+		log.Println("error with stdin scanner: ", err)
+		os.Exit(1)
 	}
-
-	return &rowData, nil
+	return rowData
 }
 
-func ProcessTestData(rowData []GoTestJsonRowData) (*ProcessedTestdata, error) {
-	packageDetailsMap := map[string]PackageDetails{}
-	for _, r := range rowData {
-		if r.Test == "" {
-			if r.Action == "fail" || r.Action == "pass" || r.Action == "skip" {
-				elapsedTime, timeSymbol := formatTimeDisplay(r.Elapsed)
-				packageDetailsMap[r.Package] = PackageDetails{
-					Name:        r.Package,
-					ElapsedTime: elapsedTime,
-					TimeSymbol:  timeSymbol,
-					Status:      r.Action,
-					Coverage:    packageDetailsMap[r.Package].Coverage,
-				}
-			}
-
-			// get package coverage data
-			if r.Action == "output" {
-				// check if output contains coverage data
-				coverage := "-"
-				if strings.Contains(r.Output, "coverage") && strings.Contains(r.Output, "%") {
-					coverage = r.Output[strings.Index(r.Output, ":")+1 : strings.Index(r.Output, "%")+1]
-				}
-				elapsedTime, timeSymbol := formatTimeDisplay(packageDetailsMap[r.Package].ElapsedTime)
-				packageDetailsMap[r.Package] = PackageDetails{
-					Name:        packageDetailsMap[r.Package].Name,
-					ElapsedTime: elapsedTime,
-					TimeSymbol:  timeSymbol,
-					Status:      packageDetailsMap[r.Package].Status,
-					Coverage:    coverage,
-				}
-			}
-		}
-	}
-
-	testSuiteSlice := make([]TestDetails, 0)
-	testCasesSlice := make([]TestDetails, 0)
+// Process data from logs to generate report
+func ProcessTestData(rowData []GoTestJsonRowData) ProcessedTestdata {
+	testCasesIdx := map[string]TestDetails{}
+	packageDetailsIdx := map[string]PackageDetails{}
 	passedTests := 0
 	failedTests := 0
+	skippedTests := 0
+
 	for _, r := range rowData {
 		if r.Test != "" {
-			testNameSlice := strings.Split(r.Test, "/")
-
-			// if testNameSlice is not equal 1 then we assume we have a test case information. Record test case info
-			if len(testNameSlice) != 1 {
-				if r.Action == "fail" || r.Action == "pass" {
-					elapsedTime, timeSymbol := formatTimeDisplay(r.Elapsed)
-					testCasesSlice = append(
-						testCasesSlice,
-						TestDetails{
-							PackageName: r.Package,
-							Name:        r.Test,
-							ElapsedTime: elapsedTime,
-							TimeSymbol:  timeSymbol,
-							Status:      r.Action,
-						},
-					)
+			packageName = r.Test
+			var jsonMap Output
+			if strings.Contains(r.Output, "k3s test") {
+				output2 := strings.LastIndex(r.Output, "}")
+				output2 = output2 + 1
+				json.Unmarshal([]byte(strings.TrimSpace(r.Output[:output2])), &jsonMap)
+			}
+			if strings.Contains(r.Output, "OS") {
+				res := strings.Split(r.Output, "/")
+				OS = strings.TrimSpace(res[1])
+			}
+			// if testNameArr not equal 1 then we assume we have a test case
+			if len(jsonMap.Name) > 1 {
+				if jsonMap.State == "failed" || jsonMap.State == "passed" || jsonMap.State == "skipped" {
+					testCasesIdx[r.Test+jsonMap.Name] = TestDetails{
+						PackageName: r.Test,
+						Name:        jsonMap.Name,
+						ElapsedTime: jsonMap.Time / (1000 * 1000 * 1000 * 60),
+						Status:      jsonMap.State,
+					}
 				}
-				if r.Action == "fail" {
+				if jsonMap.State == "failed" {
 					failedTests = failedTests + 1
-				} else if r.Action == "pass" {
+				} else if jsonMap.State == "passed" {
 					passedTests = passedTests + 1
+				} else if jsonMap.State == "skipped" {
+					skippedTests = skippedTests + 1
 				}
-				continue
 			}
-
-			// record test suite info
-			if r.Action == "fail" || r.Action == "pass" {
-				elapsedTime, timeSymbol := formatTimeDisplay(r.Elapsed)
-				testSuiteSlice = append(
-					testSuiteSlice,
-					TestDetails{
-						PackageName: r.Package,
-						Name:        r.Test,
-						ElapsedTime: elapsedTime,
-						TimeSymbol:  timeSymbol,
-						Status:      r.Action,
-					})
+		} else {
+			if r.Action == "fail" || r.Action == "pass" || r.Action == "skip" {
+				packageDetailsIdx[packageName] = PackageDetails{
+					Name:         packageName,
+					ElapsedTime:  r.Elapsed / 60,
+					Status:       r.Action,
+					FailedTests:  failedTests,
+					PassedTests:  passedTests,
+					SkippedTests: skippedTests,
+				}
 			}
-			if r.Action == "fail" {
-				failedTests = failedTests + 1
-			} else if r.Action == "pass" {
-				passedTests = passedTests + 1
+			if r.Action == "output" {
+				packageDetailsIdx[packageName] = PackageDetails{
+					Name:         packageName,
+					ElapsedTime:  packageDetailsIdx[r.Test].ElapsedTime,
+					Status:       packageDetailsIdx[r.Test].Status,
+					FailedTests:  failedTests,
+					PassedTests:  passedTests,
+					SkippedTests: skippedTests,
+				}
 			}
 		}
 	}
-
-	//
-	// group the test cases by their test suite
-	//
 	testSummary := make([]TestOverview, 0)
-	for _, t := range testSuiteSlice {
+	for key := range packages {
 		testCases := make([]TestDetails, 0)
-		for _, t2 := range testCasesSlice {
-			if strings.Contains(t2.Name, t.Name) && t2.PackageName == t.PackageName {
+		for _, t2 := range testCasesIdx {
+			if t2.PackageName == key {
 				testCases = append(testCases, t2)
 			}
 		}
-		testSummary = append(
-			testSummary,
-			TestOverview{
-				TestSuite: t,
-				TestCases: testCases,
-			},
-		)
+		testSummary = append(testSummary, TestOverview{
+			TestCases: testCases,
+		})
 	}
-
-	//
 	// determine total test time
-	//
 	totalTestTime := ""
 	if rowData[len(rowData)-1].Time.Sub(rowData[0].Time).Seconds() < 60 {
 		totalTestTime = fmt.Sprintf("%f s", rowData[len(rowData)-1].Time.Sub(rowData[0].Time).Seconds())
@@ -306,327 +261,213 @@ func ProcessTestData(rowData []GoTestJsonRowData) (*ProcessedTestdata, error) {
 		totalTestTime = fmt.Sprintf("%dm:%ds", min, seconds)
 	}
 	testDate := rowData[0].Time.Format(time.RFC850)
-
-	return &ProcessedTestdata{
+	return ProcessedTestdata{
 		TotalTestTime:     totalTestTime,
 		TestDate:          testDate,
 		FailedTests:       failedTests,
 		PassedTests:       passedTests,
+		SkippedTests:      skippedTests,
 		TestSummary:       testSummary,
-		PackageDetailsMap: packageDetailsMap,
-	}, nil
+		packageDetailsIdx: packageDetailsIdx,
+	}
 }
 
-func GenerateHTMLReport(totalTestTime, testDate string, failedTests, passedTests int, testSummary []TestOverview, packageDetailsMap map[string]PackageDetails) error {
+// Generate report
+func GenerateHTMLReport(totalTestTime, testDate string, failedTests, passedTests int, skippedTests int, testCasesIdx []TestOverview, packageDetailsIdx map[string]PackageDetails) {
+	templates := make([]template.HTML, 0)
+	for _, v := range packageDetailsIdx {
+		htmlString := template.HTML("<div type=\"button\" class=\"collapsible\">\n")
+		packageInfoTemplateString := template.HTML("")
 
-	testCasesEl, _ := generateTestCaseHTMLElements(testSummary)
+		if v.Status != "pass" || v.Status != "fail" || v.Status != "skip" {
+			packageInfoTemplateString = "<div>Test Run failed</div>" + "\n" + "<div>Run Time: {{.elapsedTime}}</div> " + "\n"
+		}
 
-	testSuitesEl, _ := generateTestSuiteHTMLElements(testSummary, *testCasesEl)
+		packageInfoTemplateString = "<div>{{.packageName}}</div>" + "\n" + "<div>Run Time: {{.elapsedTime}}</div> " + "\n"
+		packageInfoTemplate, err := template.New("packageInfoTemplate").Parse(string(packageInfoTemplateString))
+		if err != nil {
+			log.Println("error parsing package info template", err)
+			os.Exit(1)
+		}
 
-	packagesEl, _ := generatePackageDetailsHTMLElements(*testSuitesEl, packageDetailsMap)
+		var processedPackageTemplate bytes.Buffer
+		err = packageInfoTemplate.Execute(&processedPackageTemplate, map[string]string{
+			"packageName": v.Name + "_" + OS,
+			"elapsedTime": fmt.Sprintf("%.2f", v.ElapsedTime),
+		})
+		if err != nil {
+			log.Println("error applying package info template: ", err)
+			os.Exit(1)
+		}
+		if v.Status == "pass" {
+			packageInfoTemplateString = "<div class=\"collapsibleHeading packageCardLayout successBackgroundColor \">" +
+				template.HTML(processedPackageTemplate.Bytes()) + "</div>"
+		} else if v.Status == "fail" {
+			packageInfoTemplateString = "<div class=\"collapsibleHeading packageCardLayout failBackgroundColor \">" +
+				template.HTML(processedPackageTemplate.Bytes()) + "</div>"
+		} else {
+			packageInfoTemplateString = "<div class=\"collapsibleHeading packageCardLayout skipBackgroundColor \">" +
+				template.HTML(processedPackageTemplate.Bytes()) + "</div>"
+		}
 
+		htmlString = htmlString + "\n" + packageInfoTemplateString
+
+		testInfoTemplateString := template.HTML("")
+		for k, pt := range testCasesIdx {
+			testHTMLTemplateString := template.HTML("")
+			if len(pt.TestCases) == 0 {
+				log.Println("Test run failed, Exiting..")
+				os.Exit(1)
+			}
+			//Access testcases for correcponding package
+			if pt.TestCases[k].PackageName == v.Name {
+				// check if test contains test cases
+				if len(pt.TestCases) == 0 {
+					// test does not contain test cases
+					testHTMLTemplateString = "<div>{{.testName}}</div>" + "\n" + "<div>{{.elapsedTime}}s</div>"
+					testTemplate, err := template.New("standaloneTests").Parse(string(testHTMLTemplateString))
+					if err != nil {
+						log.Println("error parsing standalone tests template: ", err)
+						os.Exit(1)
+					}
+					var processedTestTemplate bytes.Buffer
+					err = testTemplate.Execute(&processedTestTemplate, map[string]string{
+						"testName":    pt.Test.Name,
+						"elapsedTime": fmt.Sprintf("%.2f", pt.Test.ElapsedTime),
+					})
+					if err != nil {
+						log.Println("error applying standalone tests template: ", err)
+						os.Exit(1)
+					}
+					if pt.Test.Status == "passed" {
+						testHTMLTemplateString = "<div class=\"testCardLayout successBackgroundColor \">" + template.HTML(processedTestTemplate.Bytes()) + "</div>"
+					} else if pt.Test.Status == "failed" {
+						testHTMLTemplateString = "<div class=\"testCardLayout failBackgroundColor \">" + template.HTML(processedTestTemplate.Bytes()) + "</div>"
+					} else {
+						testHTMLTemplateString = "<div class=\"testCardLayout skipBackgroundColor \">" + template.HTML(processedTestTemplate.Bytes()) + "</div>"
+					}
+					testInfoTemplateString = testInfoTemplateString + "\n" + testHTMLTemplateString
+					continue
+				}
+
+				if pt.Test.Status == "passed" {
+					testHTMLTemplateString = "<div type=\"button\" class=\"collapsible \">" +
+						"\n" + "<div class=\"collapsibleHeading testCardLayout successBackgroundColor \">" +
+						"<div>+ {{.testName}}</div>" + "\n" + "<div>{{.elapsedTime}}s</div>" + "\n" +
+						"</div>" + "\n" +
+						"<div class=\"collapsibleHeadingContent\">"
+				} else if pt.Test.Status == "failed" {
+					testHTMLTemplateString = "<div type=\"button\" class=\"collapsible \">" +
+						"\n" + "<div class=\"collapsibleHeading testCardLayout failBackgroundColor \">" +
+						"<div>+ {{.testName}}</div>" + "\n" + "<div>{{.elapsedTime}}s</div>" + "\n" +
+						"</div>" + "\n" +
+						"<div class=\"collapsibleHeadingContent\">"
+				} else {
+					testHTMLTemplateString = "<div type=\"button\" class=\"collapsible \">" +
+						"\n" + "<div class=\"collapsibleHeading testCardLayout skipBackgroundColor \">" +
+						"<div>+ {{.testName}}</div>" + "\n" + "<div>{{.elapsedTime}}s</div>" + "\n" +
+						"</div>" + "\n" +
+						"<div class=\"collapsibleHeadingContent\">"
+				}
+
+				testTemplate, err := template.New("nonStandaloneTest").Parse(string(testHTMLTemplateString))
+				if err != nil {
+					log.Println("error parsing non standalone tests template: ", err)
+					os.Exit(1)
+				}
+				var processedTestTemplate bytes.Buffer
+				err = testTemplate.Execute(&processedTestTemplate, map[string]string{
+					"testName":    pt.Test.Name,
+					"elapsedTime": fmt.Sprintf("%f", pt.Test.ElapsedTime),
+				})
+				if err != nil {
+					log.Println("error applying non standalone tests template: ", err)
+					os.Exit(1)
+				}
+				testHTMLTemplateString = template.HTML(processedTestTemplate.Bytes())
+				testCaseHTMlTemplateString := template.HTML("")
+				for _, tC := range pt.TestCases {
+					testCaseHTMlTemplateString = "<div>{{.testName}}</div>" + "\n" + "<div>{{.elapsedTime}}m</div>"
+					testCaseTemplate, err := template.New("testCase").Parse(string(testCaseHTMlTemplateString))
+					if err != nil {
+						log.Println("error parsing test case template: ", err)
+						os.Exit(1)
+					}
+
+					var processedTestCaseTemplate bytes.Buffer
+					err = testCaseTemplate.Execute(&processedTestCaseTemplate, map[string]string{
+						"testName":    tC.Name,
+						"elapsedTime": fmt.Sprintf("%f", tC.ElapsedTime),
+					})
+					if err != nil {
+						log.Println("error applying test case template: ", err)
+						os.Exit(1)
+					}
+					if tC.Status == "passed" {
+						testCaseHTMlTemplateString = "<div class=\"testCardLayout successBackgroundColor \">" + template.HTML(processedTestCaseTemplate.Bytes()) + "</div>"
+
+					} else if tC.Status == "failed" {
+						testCaseHTMlTemplateString = "<div  class=\"testCardLayout failBackgroundColor \">" + template.HTML(processedTestCaseTemplate.Bytes()) + "</div>"
+
+					} else {
+						testCaseHTMlTemplateString = "<div  class=\"testCardLayout skipBackgroundColor \">" + template.HTML(processedTestCaseTemplate.Bytes()) + "</div>"
+					}
+					testHTMLTemplateString = testHTMLTemplateString + "\n" + testCaseHTMlTemplateString
+				}
+				testHTMLTemplateString = testHTMLTemplateString + "\n" + "</div>" + "\n" + "</div>"
+				testInfoTemplateString = testInfoTemplateString + "\n" + testHTMLTemplateString
+			}
+		}
+		htmlString = htmlString + "\n" + "<div class=\"collapsibleHeadingContent\">\n" + testInfoTemplateString + "\n" + "</div>"
+		htmlString = htmlString + "\n" + "</div>"
+		templates = append(templates, htmlString)
+	}
 	reportTemplate := template.New("report-template.html")
+
 	reportTemplateData, err := assets.Asset("report-template.html")
 	if err != nil {
-		log.Error().Err(err).Msg("error retrieving report-template.html")
-		return err
+		log.Println("error retrieving report-template.html: ", err)
+		os.Exit(1)
 	}
 
 	report, err := reportTemplate.Parse(string(reportTemplateData))
 	if err != nil {
-		log.Error().Err(err).Msg("error parsing report-template.html")
-		return err
+		log.Println("error parsing report-template.html: ", err)
+		os.Exit(1)
 	}
-
 	var processedTemplate bytes.Buffer
 	type templateData struct {
 		HTMLElements  []template.HTML
 		FailedTests   int
 		PassedTests   int
+		SkippedTests  int
 		TotalTestTime string
 		TestDate      string
 	}
 
 	err = report.Execute(&processedTemplate,
 		&templateData{
-			HTMLElements:  []template.HTML{template.HTML(packagesEl)},
+			HTMLElements:  templates,
 			FailedTests:   failedTests,
 			PassedTests:   passedTests,
+			SkippedTests:  skippedTests,
 			TotalTestTime: totalTestTime,
 			TestDate:      testDate,
 		},
 	)
 	if err != nil {
-		log.Error().Err(err).Msg("error applying report-template.html")
-		return err
+		log.Println("error applying report-template.html: ", err)
+		os.Exit(1)
 	}
-
-	var path = ""
-	if outputDirectory == "" {
-		path = "./report.html"
-	} else {
-		path = fmt.Sprintf("%s/report.html", outputDirectory)
-	}
-
 	// write the whole body at once
-	err = ioutil.WriteFile(path, processedTemplate.Bytes(), 0644)
+	err = ioutil.WriteFile("k3s_"+OS+"_results.html", processedTemplate.Bytes(), 0644)
 	if err != nil {
-		log.Error().Err(err).Msg("error writing report.html file")
-		return err
+		log.Println("error writing report.html file: ", err)
+		os.Exit(1)
 	}
-
-	return nil
 }
 
-// generate test cases cards
-func generateTestCaseHTMLElements(testsLogOverview []TestOverview) (*map[string][]string, error) {
-	testCasesCardsMap := make(map[string][]string)
-	testCaseCard := template.HTML("")
-
-	for _, testSuite := range testsLogOverview {
-		for _, testCaseDetails := range testSuite.TestCases {
-			testCaseCard = `
-										<div>{{.testName}}</div>
-										<div>{{.elapsedTime}}{{.timeSymbol}}</div>
-									`
-			testCaseTemplate, err := template.New("testCase").Parse(string(testCaseCard))
-			if err != nil {
-				log.Error().Err(err).Msg("error parsing test case template")
-				return nil, err
-			}
-
-			var processedTestCaseTemplate bytes.Buffer
-			err = testCaseTemplate.Execute(&processedTestCaseTemplate, map[string]string{
-				"testName":    testCaseDetails.Name,
-				"elapsedTime": fmt.Sprintf("%f", testCaseDetails.ElapsedTime),
-				"timeSymbol":  fmt.Sprintf("%s", testCaseDetails.TimeSymbol),
-			})
-
-			if err != nil {
-				log.Error().Err(err).Msg("error applying test case template")
-				return nil, err
-			}
-			if testCaseDetails.Status == "pass" {
-				testCaseCard = template.HTML(
-					fmt.Sprintf(`
-												<div class="testCardLayout successBackgroundColor">
-												%s
-												</div>
-											`,
-						template.HTML(processedTestCaseTemplate.Bytes()),
-					),
-				)
-
-			} else if testCaseDetails.Status == "fail" {
-				testCaseCard = template.HTML(
-					fmt.Sprintf(`
-												<div class="testCardLayout failBackgroundColor ">
-												%s
-												</div>
-												`,
-						template.HTML(processedTestCaseTemplate.Bytes()),
-					),
-				)
-
-			}
-			testCasesCardsMap[testSuite.TestSuite.Name+"-"+testSuite.TestSuite.PackageName] = append(testCasesCardsMap[testSuite.TestSuite.Name], string(testCaseCard))
-		}
-	}
-
-	return &testCasesCardsMap, nil
-}
-
-// generate test suites cards
-func generateTestSuiteHTMLElements(testLogOverview []TestOverview, testCaseHTMLCards map[string][]string) (*map[string][]string, error) {
-	testSuiteCollapsibleCardsMap := make(map[string][]string)
-	collapsible := template.HTML("")
-	collapsibleHeading := template.HTML("")
-	collapsibleHeadingTemplate := ""
-	collapsibleContent := template.HTML("")
-
-	for _, testSuite := range testLogOverview {
-		collapsibleHeadingTemplate = `		
-										<div>{{.testName}}</div>
-										<div>{{.elapsedTime}}{{.timeSymbol}}</div>
-									`
-		testCaseTemplate, err := template.New("testSuite").Parse(collapsibleHeadingTemplate)
-		if err != nil {
-			log.Error().Err(err).Msg("error parsing test case template")
-			return nil, err
-		}
-
-		var processedTestCaseTemplate bytes.Buffer
-		err = testCaseTemplate.Execute(&processedTestCaseTemplate, map[string]string{
-			"testName":    testSuite.TestSuite.Name,
-			"elapsedTime": fmt.Sprintf("%f", testSuite.TestSuite.ElapsedTime),
-			"timeSymbol":  fmt.Sprintf("%s", testSuite.TestSuite.TimeSymbol),
-		})
-		if err != nil {
-			log.Error().Err(err).Msg("error applying test case template")
-			return nil, err
-		}
-
-		if testSuite.TestSuite.Status == "pass" {
-			collapsibleHeading = template.HTML(
-				fmt.Sprintf(`
-											<div class="testCardLayout successBackgroundColor collapsibleHeading">
-											%s
-											</div>
-										`,
-					template.HTML(processedTestCaseTemplate.Bytes()),
-				),
-			)
-
-		} else if testSuite.TestSuite.Status == "fail" {
-			collapsibleHeading = template.HTML(
-				fmt.Sprintf(`
-											<div class="testCardLayout failBackgroundColor collapsibleHeading">
-											%s
-											</div>
-										`,
-					template.HTML(processedTestCaseTemplate.Bytes()),
-				),
-			)
-		}
-
-		// construct a collapsible content
-		collapsibleContent = template.HTML(
-			fmt.Sprintf(`
-									<div class="collapsibleHeadingContent">
-										%s
-									</div>
-							`,
-				strings.Join(testCaseHTMLCards[testSuite.TestSuite.Name+"-"+testSuite.TestSuite.PackageName], "\n"),
-			),
-		)
-
-		// wrap in a collapsible
-		collapsible = template.HTML(
-			fmt.Sprintf(`
-						<div type="button" class="collapsible">
-							%s
-							%s
-						</div>
-							`,
-				string(collapsibleHeading),
-				string(collapsibleContent),
-			),
-		)
-
-		testSuiteCollapsibleCardsMap[testSuite.TestSuite.PackageName] = append(testSuiteCollapsibleCardsMap[testSuite.TestSuite.PackageName], string(collapsible))
-	}
-
-	return &testSuiteCollapsibleCardsMap, nil
-}
-
-// generate package cards
-func generatePackageDetailsHTMLElements(testSuiteOverview map[string][]string, packageDetailsMap map[string]PackageDetails) (string, error) {
-	collapsibleHeading := template.HTML("")
-	collapsible := template.HTML("")
-	collapsibleHeadingTemplate := ""
-	collapsibleContent := template.HTML("")
-	elem := make([]string, 0)
-
-	for _, v := range packageDetailsMap {
-		collapsibleHeadingTemplate = `
-											<div>{{.packageName}}</div>
-											<div>{{.coverage}}</div>
-											<div>{{.elapsedTime}}{{.timeSymbol}}</div>
-											`
-
-		packageInfoTemplate, err := template.New("packageInfoTemplate").Parse(string(collapsibleHeadingTemplate))
-		if err != nil {
-			log.Error().Err(err).Msg("error parsing package info template")
-			os.Exit(1)
-		}
-		var processedPackageTemplate bytes.Buffer
-		err = packageInfoTemplate.Execute(&processedPackageTemplate, map[string]string{
-			"packageName": v.Name,
-			"elapsedTime": fmt.Sprintf("%f", v.ElapsedTime),
-			"timeSymbol":  fmt.Sprintf("%s", v.TimeSymbol),
-			"coverage":    v.Coverage,
-		})
-		if err != nil {
-			log.Error().Err(err).Msg("error applying package info template")
-			os.Exit(1)
-		}
-
-		if v.Status == "pass" {
-			collapsibleHeading = template.HTML(
-				fmt.Sprintf(
-					`
-							<div class="collapsibleHeading packageCardLayout successBackgroundColor ">
-								%s
-							</div>
-						`,
-					template.HTML(processedPackageTemplate.Bytes()),
-				),
-			)
-
-		} else if v.Status == "fail" {
-			collapsibleHeading = template.HTML(
-				fmt.Sprintf(
-					`
-							<div class="collapsibleHeading packageCardLayout failBackgroundColor ">
-								%s
-							</div>
-						`,
-					template.HTML(processedPackageTemplate.Bytes()),
-				),
-			)
-
-		} else {
-			collapsibleHeading = template.HTML(
-				fmt.Sprintf(
-					`
-							<div class="collapsibleHeading packageCardLayout skipBackgroundColor">
-								%s
-							</div>
-						`,
-					template.HTML(processedPackageTemplate.Bytes()),
-				),
-			)
-		}
-
-		// construct a collapsible content
-		collapsibleContent = template.HTML(
-			fmt.Sprintf(`
-									<div class="collapsibleHeadingContent">
-										%s
-									</div>
-							`,
-				strings.Join(testSuiteOverview[v.Name], "\n"),
-			),
-		)
-
-		// wrap in a collapsible
-		collapsible = template.HTML(
-			fmt.Sprintf(`
-						<div type="button" class="collapsible">
-							%s
-							%s
-						</div>
-							`,
-				string(collapsibleHeading),
-				string(collapsibleContent),
-			),
-		)
-
-		elem = append(elem, string(collapsible))
-	}
-
-	return strings.Join(elem, "\n"), nil
-}
-
-func formatTimeDisplay(secs float64) (float64, string) {
-	if secs > 1 {
-		return secs, "s"
-	}
-
-	parsed, err := time.ParseDuration(fmt.Sprintf("%vs", secs))
-	if err != nil {
-		return 0, "ms"
-	}
-
-	return float64(parsed.Milliseconds()), "ms"
+func launchhtml() {
+	http.Handle("/", http.FileServer(http.Dir("./reports")))
+	http.ListenAndServe(":80", nil)
 }
